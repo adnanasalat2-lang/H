@@ -6,7 +6,7 @@ from flask_cors import CORS
 import threading
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 DATA_DIR = '/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(DATA_DIR, 'database.json')
@@ -32,14 +32,14 @@ def persist_database():
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-Requested-With'
     response.headers['Access-Control-Allow-Methods'] = 'GET,PUT,POST,DELETE,OPTIONS'
     return response
 
 @app.route('/api/new-hcaptcha', methods=['POST', 'OPTIONS'])
 def new_task():
     if request.method == 'OPTIONS':
-        return jsonify({'success': True})
+        return jsonify({'success': True}), 200
     task = request.json
     if not task or 'taskId' not in task:
         return jsonify({'success': False})
@@ -55,20 +55,24 @@ def new_task():
     threading.Thread(target=persist_database).start()
     return jsonify({'success': True, 'autoSolved': False})
 
-@app.route('/api/check-hcaptcha/<task_id>', methods=['GET'])
+@app.route('/api/check-hcaptcha/<task_id>', methods=['GET', 'OPTIONS'])
 def check_task(task_id):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
     if task_id in hcaptcha_trained:
         return jsonify({'status': 'solved', 'clicks': hcaptcha_trained[task_id].get('clicks', [])})
     return jsonify({'status': 'pending'})
 
-@app.route('/api/get-hcaptcha', methods=['GET'])
+@app.route('/api/get-hcaptcha', methods=['GET', 'OPTIONS'])
 def get_tasks():
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True}), 200
     return jsonify({'pending': hcaptcha_pending, 'trained': hcaptcha_trained})
 
 @app.route('/api/submit-hcaptcha', methods=['POST', 'OPTIONS'])
 def submit_task():
     if request.method == 'OPTIONS':
-        return jsonify({'success': True})
+        return jsonify({'success': True}), 200
     data = request.json
     task_id = data.get('taskId')
     clicks = data.get('clicks', [])
@@ -90,7 +94,7 @@ def submit_task():
 @app.route('/api/delete-hcaptcha/<task_id>', methods=['DELETE', 'OPTIONS'])
 def delete_task(task_id):
     if request.method == 'OPTIONS':
-        return jsonify({'success': True})
+        return jsonify({'success': True}), 200
     if task_id in hcaptcha_pending: del hcaptcha_pending[task_id]
     if task_id in hcaptcha_trained: del hcaptcha_trained[task_id]
     threading.Thread(target=persist_database).start()

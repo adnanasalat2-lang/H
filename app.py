@@ -5,8 +5,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-# Yeh line har qisam ke CORS error ko hamesha ke liye allow kar degi
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
 DATA_DIR = '/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(DATA_DIR, 'database.json')
@@ -31,7 +30,7 @@ def persist_database():
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({'status': 'Server is running perfectly!'})
+    return jsonify({'status': 'Server is running perfectly on Port 3000!'})
 
 @app.route('/api/new-hcaptcha', methods=['POST', 'OPTIONS'])
 def new_task():
@@ -98,6 +97,5 @@ def delete_task(task_id):
     return jsonify({'success': True})
 
 if __name__ == '__main__':
-    # Railway khud PORT provide karta hai, agar na mile toh 3000
-    port = int(os.environ.get('PORT', 3000))
-    app.run(host='0.0.0.0', port=port)
+    # PORT KO ZABARDASTI 3000 PAR LOCK KAR DIYA HAI TA KAY RAILWAY KE SATH MATCH HO JAYE
+    app.run(host='0.0.0.0', port=3000)

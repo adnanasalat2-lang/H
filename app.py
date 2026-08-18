@@ -1,12 +1,8 @@
 import os
 import json
 import base64
-from io import BytesIO
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from PIL import Image
-import torch
-from transformers import CLIPProcessor, CLIPModel
 import threading
 
 app = Flask(__name__)
@@ -14,22 +10,6 @@ CORS(app)
 
 DATA_DIR = '/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(DATA_DIR, 'database.json')
-
-clip_model = None
-clip_processor = None
-
-def load_ai_models():
-    global clip_model, clip_processor
-    print("Loading CLIP Model in background...")
-    try:
-        clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        print("CLIP Model Loaded Successfully!")
-    except Exception as e:
-        print("Model Load Error:", e)
-
-# Background mein model load karo taake Railway timeout na de
-threading.Thread(target=load_ai_models).start()
 
 hcaptcha_pending = {}
 hcaptcha_trained = {}
@@ -49,77 +29,14 @@ def persist_database():
     except:
         pass
 
-def base64_to_image(base64_string):
-    if "," in base64_string:
-        base64_string = base64_string.split(",")[1]
-    img_data = base64.b64decode(base64_string)
-    return Image.open(BytesIO(img_data)).convert("RGB")
-
-def evaluate_auto_solve(task):
-    if global_not_ready():
-        return {'solved': False}
-        
-    if task['taskId'] in hcaptcha_trained:
-        return {'solved': True, 'clicks': hcaptcha_trained[task['taskId']].get('clicks', [])}
-
-    prompt_text = task.get('prompt', '').split('|||')[0].strip()
-    media_list = task.get('media', [])
-    if not media_list or len(media_list) <= 1:
-        return {'solved': False}
-
-    images = []
-    indices = []
-    for m in media_list:
-        if m.get('src'):
-            try:
-                img = base64_to_image(m['src'])
-                images.append(img)
-                indices.append(m['index'])
-            except:
-                pass
-    
-    predicted_clicks = []
-    if images and clip_model and clip_processor:
-        try:
-            inputs = clip_processor(text=[prompt_text], images=images, return_tensors="pt", padding=True)
-            outputs = clip_model(**inputs)
-            logits_per_image = outputs.logits_per_image
-            
-            for i, score in enumerate(logits_per_image):
-                if score[0].item() > 23.5:
-                    predicted_clicks.append(indices[i])
-        except Exception as e:
-            print("CLIP Error:", e)
-
-    if 1 <= len(predicted_clicks) <= 6:
-        hcaptcha_trained[task['taskId']] = {
-            'id': task['taskId'],
-            'prompt': task['prompt'],
-            'clicks': predicted_clicks,
-            'media': media_list
-        }
-        
-        if len(hcaptcha_trained) > 200:
-            first_key = list(hcaptcha_trained.keys())[0]
-            del hcaptcha_trained[first_key]
-            
-        return {'solved': True, 'clicks': predicted_clicks}
-
-    return {'solved': False}
-
-def global_not_ready():
-    return clip_model is None or clip_processor is None
-
 @app.route('/api/new-hcaptcha', methods=['POST'])
 def new_task():
     task = request.json
     if not task or 'taskId' not in task:
         return jsonify({'success': False})
 
-    auto_res = evaluate_auto_solve(task)
-    if auto_res['solved']:
-        threading.Thread(target=persist_database).start()
-        return jsonify({'success': True, 'autoSolved': True})
+    if task['taskId'] in hcaptcha_trained:
+        return jsonify({'success': True, 'autoSolved': True, 'clicks': hcaptcha_trained[task['taskId']].get('clicks', [])})
 
     if len(hcaptcha_pending) > 60:
         first_key = list(hcaptcha_pending.keys())[0]

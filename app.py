@@ -7,7 +7,7 @@ from io import BytesIO
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# AI Models (Background load honge taake server crash na ho)
+# AI Models (Background load honge)
 try:
     from transformers import CLIPProcessor, CLIPModel
     from PIL import Image
@@ -61,33 +61,59 @@ def persist_database():
     except: pass
 
 def process_ai_task(task):
-    """Asli AI Logic jo images dekh kar solve karegi"""
+    """Mukammal AI Engine: Image-to-Image aur Text-to-Image dono ke liye"""
     if ai_status != "Ready" or not task.get('media'): return None
     try:
         prompt_full = task.get('prompt', '')
         media = task.get('media', [])
         clicks = []
 
-        # Agar Reference image di gayi hai (jaise Kolotibablo mein hoti hai)
-        if '|||' in prompt_full:
-            example_b64 = prompt_full.split('|||')[1]
-            ref_b64 = example_b64.split(',')[1] if ',' in example_b64 else example_b64
+        # Check karein ke reference image hai ya sirf text hai
+        has_ref = '|||' in prompt_full
+        text_prompt = prompt_full.split('|||')[0].strip()
+
+        # Grid tasweeron ko process karein
+        target_images = []
+        for m in media:
+            m_b64 = m['src'].split(',')[1] if ',' in m['src'] else m['src']
+            img = Image.open(BytesIO(base64.b64decode(m_b64))).convert("RGB")
+            target_images.append((m['index'], img))
+
+        if has_ref:
+            # SCENARIO 1: IMAGE-TO-IMAGE MATCHING
+            ref_b64 = prompt_full.split('|||')[1]
+            ref_b64 = ref_b64.split(',')[1] if ',' in ref_b64 else ref_b64
             ref_img = Image.open(BytesIO(base64.b64decode(ref_b64))).convert("RGB")
+            
             ref_inputs = ai_processor(images=ref_img, return_tensors="pt")
             ref_features = ai_model.get_image_features(**ref_inputs)
             ref_features = ref_features / ref_features.norm(p=2, dim=-1, keepdim=True)
 
-            for m in media:
-                m_b64 = m['src'].split(',')[1] if ',' in m['src'] else m['src']
-                img = Image.open(BytesIO(base64.b64decode(m_b64))).convert("RGB")
+            for idx, img in target_images:
                 img_inputs = ai_processor(images=img, return_tensors="pt")
                 img_features = ai_model.get_image_features(**img_inputs)
                 img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
                 
-                # Similarity check (Agar 85% se zyada match hai toh click karo)
                 similarity = (ref_features @ img_features.T).item()
                 if similarity > 0.85:
-                    clicks.append(m['index'])
+                    clicks.append(idx)
+        else:
+            # SCENARIO 2: TEXT-TO-IMAGE MATCHING (Jaise fridge wali tasveer)
+            clip_text = f"a photo of {text_prompt}"
+            text_inputs = ai_processor(text=[clip_text], return_tensors="pt", padding=True)
+            text_features = ai_model.get_text_features(**text_inputs)
+            text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+
+            for idx, img in target_images:
+                img_inputs = ai_processor(images=img, return_tensors="pt")
+                img_features = ai_model.get_image_features(**img_inputs)
+                img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
+                
+                similarity = (text_features @ img_features.T).item()
+                # CLIP mein text-to-image similarity aam tor par 0.22 se oopar match hoti hai
+                if similarity > 0.22:
+                    clicks.append(idx)
+                    
         return clicks
     except Exception as e:
         print(f"AI Processing Error: {e}")
@@ -103,17 +129,17 @@ def new_task():
     task = request.json
     if not task or 'taskId' not in task: return jsonify({'success': False})
 
-    # 1. Check if trained manually
+    # 1. Manual Cache check
     if task['taskId'] in hcaptcha_trained:
         return jsonify({'success': True, 'autoSolved': True, 'clicks': hcaptcha_trained[task['taskId']].get('clicks', [])})
 
-    # 2. FULL AI AUTO-SOLVE
+    # 2. FULL AI AUTO-SOLVE (Ab dono text aur image ke liye)
     ai_clicks = process_ai_task(task)
     if ai_clicks is not None and len(ai_clicks) > 0:
         hcaptcha_trained[task['taskId']] = {'clicks': ai_clicks}
         return jsonify({'success': True, 'autoSolved': True, 'clicks': ai_clicks})
 
-    # 3. Agar AI fail ho jaye ya abhi load ho raha ho toh Dashboard par bhej do
+    # 3. Fail hone par Dashboard
     if len(hcaptcha_pending) > 60: del hcaptcha_pending[list(hcaptcha_pending.keys())[0]]
     hcaptcha_pending[task['taskId']] = task
     threading.Thread(target=persist_database).start()

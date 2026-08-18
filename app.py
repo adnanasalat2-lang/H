@@ -90,16 +90,10 @@ def new_task():
 
     # 2. FULL AI AUTO-SOLVER LOGIC
     if ai_status == "Ready":
-        # Yahan aapki AI automatically prompt parh kar images select karegi
-        # (Yeh ek structural example hai, model actual prediction yahan return karega)
         print(f"AI Processing Task ID: {task['taskId']} | Prompt: {task.get('prompt')}")
-        
-        # Example Auto-Click Logic by AI:
-        # ai_clicks = [0, 2, 4] # AI decide karegi konsi tasweer click karni hai
-        # hcaptcha_trained[task['taskId']] = {'clicks': ai_clicks}
-        # return jsonify({'success': True, 'autoSolved': True, 'clicks': ai_clicks})
+        # Yahan aapki AI automatically prompt parh kar images select karegi
 
-    # 3. Agar AI abhi load ho rahi hai ya new image samajh nahi aayi toh Pending mein daal do
+    # 3. Agar AI abhi load ho rahi hai toh Pending mein daal do
     if len(hcaptcha_pending) > 60:
         first_key = list(hcaptcha_pending.keys())[0]
         del hcaptcha_pending[first_key]
@@ -146,5 +140,5 @@ def delete_task(task_id):
     return jsonify({'success': True})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 3000))
-    app.run(host='0.0.0.0', port=port)
+    # PORT KO ZABARDASTI 3000 PAR LOCK KAR DIYA HAI
+    app.run(host='0.0.0.0', port=3000)

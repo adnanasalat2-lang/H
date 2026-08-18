@@ -3,6 +3,4 @@ flask-cors
 torch
 torchvision
 transformers
-ultralytics
-opencv-python-headless
 Pillow

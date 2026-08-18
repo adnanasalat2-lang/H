@@ -6,7 +6,7 @@ from flask_cors import CORS
 import threading
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 DATA_DIR = '/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(DATA_DIR, 'database.json')
@@ -29,8 +29,17 @@ def persist_database():
     except:
         pass
 
-@app.route('/api/new-hcaptcha', methods=['POST'])
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,PUT,POST,DELETE,OPTIONS'
+    return response
+
+@app.route('/api/new-hcaptcha', methods=['POST', 'OPTIONS'])
 def new_task():
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True})
     task = request.json
     if not task or 'taskId' not in task:
         return jsonify({'success': False})
@@ -56,8 +65,10 @@ def check_task(task_id):
 def get_tasks():
     return jsonify({'pending': hcaptcha_pending, 'trained': hcaptcha_trained})
 
-@app.route('/api/submit-hcaptcha', methods=['POST'])
+@app.route('/api/submit-hcaptcha', methods=['POST', 'OPTIONS'])
 def submit_task():
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True})
     data = request.json
     task_id = data.get('taskId')
     clicks = data.get('clicks', [])
@@ -76,8 +87,10 @@ def submit_task():
         
     return jsonify({'success': True})
 
-@app.route('/api/delete-hcaptcha/<task_id>', methods=['DELETE'])
+@app.route('/api/delete-hcaptcha/<task_id>', methods=['DELETE', 'OPTIONS'])
 def delete_task(task_id):
+    if request.method == 'OPTIONS':
+        return jsonify({'success': True})
     if task_id in hcaptcha_pending: del hcaptcha_pending[task_id]
     if task_id in hcaptcha_trained: del hcaptcha_trained[task_id]
     threading.Thread(target=persist_database).start()

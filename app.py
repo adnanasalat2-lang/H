@@ -1,13 +1,13 @@
 import os
 import json
 import threading
-import time
 import base64
 from io import BytesIO
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import gc
 
-# AI Models (Background load honge)
+# AI Models
 try:
     from transformers import CLIPProcessor, CLIPModel
     from PIL import Image
@@ -36,11 +36,12 @@ def load_ai_model():
         ai_status = "Failed"
         return
     try:
-        print("Downloading & Loading AI CLIP Model in Background...")
+        print("Downloading & Loading AI CLIP Model...")
         ai_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
         ai_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        ai_model.eval()  # Model ko evaluation mode mein daalna taake RAM bachay
         ai_status = "Ready"
-        print("✅ AI Engine 100% LOADED & ACTIVE!")
+        print("✅ AI Engine 100% LOADED, ACTIVE & RAM-SAFE!")
     except Exception as e:
         ai_status = "Failed"
         print(f"AI Load Error: {e}")
@@ -61,59 +62,59 @@ def persist_database():
     except: pass
 
 def process_ai_task(task):
-    """Mukammal AI Engine: Image-to-Image aur Text-to-Image dono ke liye"""
     if ai_status != "Ready" or not task.get('media'): return None
     try:
         prompt_full = task.get('prompt', '')
         media = task.get('media', [])
         clicks = []
 
-        # Check karein ke reference image hai ya sirf text hai
         has_ref = '|||' in prompt_full
-        text_prompt = prompt_full.split('|||')[0].strip()
+        raw_text = prompt_full.split('|||')[0].strip()
+        
+        # Kolotibablo ke prompts ki perfect cleaning
+        clean_text = raw_text.lower().replace('select all ', '').replace('please click on the ', '').replace('images with ', '').replace('click on all concepts shown in the reference', '')
+        if clean_text.strip() == "": clean_text = "object"
 
-        # Grid tasweeron ko process karein
         target_images = []
         for m in media:
             m_b64 = m['src'].split(',')[1] if ',' in m['src'] else m['src']
             img = Image.open(BytesIO(base64.b64decode(m_b64))).convert("RGB")
             target_images.append((m['index'], img))
 
-        if has_ref:
-            # SCENARIO 1: IMAGE-TO-IMAGE MATCHING
-            ref_b64 = prompt_full.split('|||')[1]
-            ref_b64 = ref_b64.split(',')[1] if ',' in ref_b64 else ref_b64
-            ref_img = Image.open(BytesIO(base64.b64decode(ref_b64))).convert("RGB")
-            
-            ref_inputs = ai_processor(images=ref_img, return_tensors="pt")
-            ref_features = ai_model.get_image_features(**ref_inputs)
-            ref_features = ref_features / ref_features.norm(p=2, dim=-1, keepdim=True)
-
-            for idx, img in target_images:
-                img_inputs = ai_processor(images=img, return_tensors="pt")
-                img_features = ai_model.get_image_features(**img_inputs)
-                img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
+        # 🚀 torch.no_grad() is the magic lock jo RAM ko hamesha khali rakhega aur crash nahi hone dega
+        with torch.no_grad():
+            if has_ref:
+                # Image-to-Image Matching
+                ref_b64 = prompt_full.split('|||')[1].split(',')[-1]
+                ref_img = Image.open(BytesIO(base64.b64decode(ref_b64))).convert("RGB")
                 
-                similarity = (ref_features @ img_features.T).item()
-                if similarity > 0.85:
-                    clicks.append(idx)
-        else:
-            # SCENARIO 2: TEXT-TO-IMAGE MATCHING (Jaise fridge wali tasveer)
-            clip_text = f"a photo of {text_prompt}"
-            text_inputs = ai_processor(text=[clip_text], return_tensors="pt", padding=True)
-            text_features = ai_model.get_text_features(**text_inputs)
-            text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+                ref_inputs = ai_processor(images=ref_img, return_tensors="pt")
+                ref_features = ai_model.get_image_features(**ref_inputs)
+                ref_features = ref_features / ref_features.norm(p=2, dim=-1, keepdim=True)
 
-            for idx, img in target_images:
-                img_inputs = ai_processor(images=img, return_tensors="pt")
-                img_features = ai_model.get_image_features(**img_inputs)
-                img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
-                
-                similarity = (text_features @ img_features.T).item()
-                # CLIP mein text-to-image similarity aam tor par 0.22 se oopar match hoti hai
-                if similarity > 0.22:
-                    clicks.append(idx)
+                for idx, img in target_images:
+                    img_inputs = ai_processor(images=img, return_tensors="pt")
+                    img_features = ai_model.get_image_features(**img_inputs)
+                    img_features = img_features / img_features.norm(p=2, dim=-1, keepdim=True)
                     
+                    similarity = (ref_features @ img_features.T).item()
+                    if similarity > 0.70:
+                        clicks.append(idx)
+            else:
+                # Text-to-Image Matching (Fridge, Strawberry etc)
+                candidate_labels = [f"a photo of {clean_text}", "a photo of an unrelated object", "a photo of a background or scenery"]
+                text_inputs = ai_processor(text=candidate_labels, return_tensors="pt", padding=True)
+
+                for idx, img in target_images:
+                    img_inputs = ai_processor(images=img, return_tensors="pt")
+                    outputs = ai_model(**img_inputs, **text_inputs)
+                    probs = outputs.logits_per_image.softmax(dim=1) 
+                    
+                    if probs[0][0].item() > 0.40:
+                        clicks.append(idx)
+
+        # Cache clear karo taake 48 profiles mein bhi heavy na ho
+        gc.collect()
         return clicks
     except Exception as e:
         print(f"AI Processing Error: {e}")
@@ -121,7 +122,7 @@ def process_ai_task(task):
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({'status': f'Server Running on Port 3000! AI: {ai_status}'})
+    return jsonify({'status': f'Paid Server Active on Port 3000! AI: {ai_status}'})
 
 @app.route('/api/new-hcaptcha', methods=['POST', 'OPTIONS'])
 def new_task():
@@ -129,17 +130,17 @@ def new_task():
     task = request.json
     if not task or 'taskId' not in task: return jsonify({'success': False})
 
-    # 1. Manual Cache check
+    # Manual Train Check
     if task['taskId'] in hcaptcha_trained:
         return jsonify({'success': True, 'autoSolved': True, 'clicks': hcaptcha_trained[task['taskId']].get('clicks', [])})
 
-    # 2. FULL AI AUTO-SOLVE (Ab dono text aur image ke liye)
+    # Asli AI Engine
     ai_clicks = process_ai_task(task)
     if ai_clicks is not None and len(ai_clicks) > 0:
         hcaptcha_trained[task['taskId']] = {'clicks': ai_clicks}
         return jsonify({'success': True, 'autoSolved': True, 'clicks': ai_clicks})
 
-    # 3. Fail hone par Dashboard
+    # AI Fail hone par dashboard par
     if len(hcaptcha_pending) > 60: del hcaptcha_pending[list(hcaptcha_pending.keys())[0]]
     hcaptcha_pending[task['taskId']] = task
     threading.Thread(target=persist_database).start()

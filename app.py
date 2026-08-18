@@ -15,9 +15,21 @@ CORS(app)
 DATA_DIR = '/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(DATA_DIR, 'database.json')
 
-print("Loading CLIP Model (For High Accuracy Grid Classification)...")
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+clip_model = None
+clip_processor = None
+
+def load_ai_models():
+    global clip_model, clip_processor
+    print("Loading CLIP Model in background...")
+    try:
+        clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        print("CLIP Model Loaded Successfully!")
+    except Exception as e:
+        print("Model Load Error:", e)
+
+# Background mein model load karo taake Railway timeout na de
+threading.Thread(target=load_ai_models).start()
 
 hcaptcha_pending = {}
 hcaptcha_trained = {}
@@ -44,6 +56,9 @@ def base64_to_image(base64_string):
     return Image.open(BytesIO(img_data)).convert("RGB")
 
 def evaluate_auto_solve(task):
+    if global_not_ready():
+        return {'solved': False}
+        
     if task['taskId'] in hcaptcha_trained:
         return {'solved': True, 'clicks': hcaptcha_trained[task['taskId']].get('clicks', [])}
 
@@ -64,7 +79,7 @@ def evaluate_auto_solve(task):
                 pass
     
     predicted_clicks = []
-    if images:
+    if images and clip_model and clip_processor:
         try:
             inputs = clip_processor(text=[prompt_text], images=images, return_tensors="pt", padding=True)
             outputs = clip_model(**inputs)
@@ -91,6 +106,9 @@ def evaluate_auto_solve(task):
         return {'solved': True, 'clicks': predicted_clicks}
 
     return {'solved': False}
+
+def global_not_ready():
+    return clip_model is None or clip_processor is None
 
 @app.route('/api/new-hcaptcha', methods=['POST'])
 def new_task():

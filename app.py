@@ -50,7 +50,7 @@ def evaluate_auto_solve(task):
     prompt_text = task.get('prompt', '').split('|||')[0].strip()
     media_list = task.get('media', [])
     if not media_list or len(media_list) <= 1:
-        return {'solved': False} # Only processing grid tasks safely with CLIP
+        return {'solved': False}
 
     images = []
     indices = []
@@ -150,4 +150,4 @@ def delete_task(task_id):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)

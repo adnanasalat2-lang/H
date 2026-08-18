@@ -1,2 +1,6 @@
 libgl1-mesa-glx
 libglib2.0-0
+libxcb1
+libxext6
+libsm6
+libxrender1

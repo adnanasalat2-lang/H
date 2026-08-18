@@ -1,12 +1,12 @@
 import os
 import json
-import base64
+import threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import threading
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+# Yeh line har qisam ke CORS error ko hamesha ke liye allow kar degi
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 DATA_DIR = '/data' if os.path.exists('/data') else os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(DATA_DIR, 'database.json')
@@ -20,7 +20,7 @@ if os.path.exists(DB_FILE):
             data = json.load(f)
             hcaptcha_trained = data.get('trained', {})
     except Exception as e:
-        print("DB Load Error:", e)
+        pass
 
 def persist_database():
     try:
@@ -29,12 +29,9 @@ def persist_database():
     except:
         pass
 
-@app.after_request
-def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization,X-Requested-With'
-    response.headers['Access-Control-Allow-Methods'] = 'GET,PUT,POST,DELETE,OPTIONS'
-    return response
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({'status': 'Server is running perfectly!'})
 
 @app.route('/api/new-hcaptcha', methods=['POST', 'OPTIONS'])
 def new_task():
@@ -101,5 +98,6 @@ def delete_task(task_id):
     return jsonify({'success': True})
 
 if __name__ == '__main__':
+    # Railway khud PORT provide karta hai, agar na mile toh 3000
     port = int(os.environ.get('PORT', 3000))
     app.run(host='0.0.0.0', port=port)

@@ -15,7 +15,6 @@ try:
     AI_AVAILABLE = True
 except ImportError:
     AI_AVAILABLE = False
-    print("Warning: AI libs not installed.")
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -24,8 +23,8 @@ DATA_DIR = '/data' if os.path.exists('/data') else os.path.dirname(os.path.abspa
 DB_FILE = os.path.join(DATA_DIR, 'database.json')
 db_lock = threading.Lock()
 
-hcaptcha_unsolved = {}   # dashboard unsolved tab
-hcaptcha_trained  = {}   # dashboard trained tab
+hcaptcha_unsolved = {}
+hcaptcha_trained  = {}
 
 ai_model = None
 ai_processor = None
@@ -36,12 +35,11 @@ def load_ai_model():
     if not AI_AVAILABLE:
         ai_status = "Failed"; return
     try:
-        print("Loading CLIP...")
         ai_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
         ai_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         ai_model.eval()
         ai_status = "Ready"
-        print("AI Ready!")
+        print("✅ AI Ready!")
     except Exception as e:
         ai_status = "Failed"
         print(f"AI Error: {e}")
@@ -66,15 +64,29 @@ def save_db():
         except Exception as e:
             print(f"DB Error: {e}")
 
+def decode_image(src):
+    """Base64 ya URL se PIL Image banao"""
+    try:
+        if src.startswith('data:'):
+            b64 = src.split(',')[1]
+        else:
+            b64 = src
+        return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+    except:
+        return None
+
 def run_ai(task):
-    """Returns (clicks, confidences) or (None, None)"""
+    """
+    Returns (clicks, confidences) or (None, None)
+    
+    ✅ FIX: Pehle saari images ko score karo, phir TOP scores wali select karo
+    CLIP ko fixed threshold se mat rokao - relative ranking use karo
+    """
     if ai_status != "Ready" or not task.get('media'):
         return None, None
     try:
         prompt_full = task.get('prompt', '')
         media = task.get('media', [])
-        clicks = []
-        confidences = {}
 
         has_ref = '|||' in prompt_full
         raw_text = prompt_full.split('|||')[0].strip()
@@ -83,65 +95,111 @@ def run_ai(task):
             .replace('please click on the ', '')
             .replace('images with ', '')
             .replace('click on all concepts shown in the reference', '')
+            .replace('find all animals based on the number provided', '')
             .strip()) or "object"
 
-        target_images = []
+        # Images load karo
+        loaded = []
         for m in media:
             if not m.get('src'): continue
-            try:
-                b64 = m['src'].split(',')[1] if ',' in m['src'] else m['src']
-                img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
-                target_images.append((m['index'], img))
-            except: continue
+            img = decode_image(m['src'])
+            if img: loaded.append((m['index'], img))
 
-        if not target_images: return None, None
+        if not loaded: return None, None
+
+        scores = {}  # index -> score (0-1)
 
         with torch.no_grad():
             if has_ref:
-                ref_b64 = prompt_full.split('|||')[1].split(',')[-1]
-                ref_img = Image.open(BytesIO(base64.b64decode(ref_b64))).convert("RGB")
+                # ✅ Image-to-Image: reference se compare
+                ref_src = prompt_full.split('|||')[1]
+                ref_img = decode_image(ref_src)
+                if not ref_img: return None, None
+
                 ref_in = ai_processor(images=ref_img, return_tensors="pt")
                 ref_feat = ai_model.get_image_features(**ref_in)
                 ref_feat = ref_feat / ref_feat.norm(p=2, dim=-1, keepdim=True)
-                for idx, img in target_images:
-                    inp = ai_processor(images=img, return_tensors="pt")
-                    feat = ai_model.get_image_features(**inp)
+
+                for idx, img in loaded:
+                    img_in = ai_processor(images=img, return_tensors="pt")
+                    feat = ai_model.get_image_features(**img_in)
                     feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
                     sim = (ref_feat @ feat.T).item()
-                    confidences[str(idx)] = round(sim, 3)
-                    if sim > 0.70: clicks.append(idx)
+                    scores[idx] = round(sim, 3)
+
+                # ✅ Relative: mean se upar wali images select karo
+                if scores:
+                    vals = list(scores.values())
+                    mean_score = sum(vals) / len(vals)
+                    # Threshold: mean + 10% gap, ya minimum 0.55
+                    threshold = max(mean_score + 0.05, 0.55)
+                    clicks = [idx for idx, s in scores.items() if s >= threshold]
+
+                    # ✅ Agar koi nahi mila, sirf top 1-2 le lo
+                    if not clicks:
+                        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                        clicks = [sorted_scores[0][0]] if sorted_scores else []
+
             else:
-                labels = [f"a photo of {clean_text}", "unrelated object", "background scenery"]
+                # ✅ Text-to-Image: har image ko score karo
+                labels = [
+                    f"a photo of {clean_text}",
+                    f"a photo of a {clean_text}",
+                    "a photo of something completely different",
+                ]
                 text_in = ai_processor(text=labels, return_tensors="pt", padding=True)
-                for idx, img in target_images:
+
+                for idx, img in loaded:
                     img_in = ai_processor(images=img, return_tensors="pt")
                     out = ai_model(**img_in, **text_in)
                     probs = out.logits_per_image.softmax(dim=1)
-                    score = probs[0][0].item()
-                    confidences[str(idx)] = round(score, 3)
-                    if score > 0.40: clicks.append(idx)
+                    # Score = probability of being the target (label 0 + label 1 combined)
+                    score = probs[0][0].item() + probs[0][1].item() * 0.5
+                    scores[idx] = round(score, 3)
+
+                # ✅ Relative selection: mean se upar wali
+                if scores:
+                    vals = list(scores.values())
+                    mean_score = sum(vals) / len(vals)
+                    max_score  = max(vals)
+
+                    # Dynamic threshold
+                    # Agar max score bohot high hai (>0.6), strict threshold
+                    # Agar max score medium hai (0.3-0.6), loose threshold
+                    if max_score > 0.6:
+                        threshold = mean_score + 0.08
+                    elif max_score > 0.35:
+                        threshold = mean_score + 0.03
+                    else:
+                        # Scores bohot low - shayad AI nahi samajh raha, null return karo
+                        return None, {}
+
+                    clicks = [idx for idx, s in scores.items() if s >= threshold]
+
+                    # ✅ Minimum 1, maximum based on typical hCaptcha (1-6 usually)
+                    if not clicks and max_score > 0.25:
+                        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                        clicks = [sorted_scores[0][0]]
 
         gc.collect()
+        confidences = {str(k): v for k, v in scores.items()}
+        print(f"AI Result: clicks={clicks}, scores={scores}")
         return clicks, confidences
+
     except Exception as e:
         print(f"AI Error: {e}")
         return None, None
 
+
 def ai_background_job(tid):
-    """
-    Background mein AI run karo.
-    Kaamyab ho to: unsolved se hata, trained mein daalo.
-    Fail ho to: unsolved mein rehne do (manual training ke liye).
-    """
     task = hcaptcha_unsolved.get(tid)
-    if not task: return  # already processed
+    if not task: return
 
     ai_clicks, confidences = run_ai(task)
 
-    if tid not in hcaptcha_unsolved: return  # manually solved ho gaya beech mein
+    if tid not in hcaptcha_unsolved: return  # manual ne solve kar diya
 
     if ai_clicks is not None:
-        # AI kaamyab - trained mein move karo
         hcaptcha_trained[tid] = {
             'id': tid,
             'prompt': task.get('prompt', ''),
@@ -153,132 +211,105 @@ def ai_background_job(tid):
             'timestamp': time.time()
         }
         hcaptcha_unsolved.pop(tid, None)
-        print(f"AI solved: {tid} -> clicks: {ai_clicks}")
+        print(f"✅ AI solved {tid}: {ai_clicks}")
     else:
-        # AI fail - unsolved mein rehne do, dashboard par manual training
-        print(f"AI failed for {tid}, waiting for manual...")
+        print(f"⏳ AI could not solve {tid}, manual needed")
 
     threading.Thread(target=save_db, daemon=True).start()
 
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({
-        'status': 'Active', 'ai': ai_status,
-        'unsolved': len(hcaptcha_unsolved),
-        'trained': len(hcaptcha_trained)
-    })
+    return jsonify({'status':'Active','ai':ai_status,'unsolved':len(hcaptcha_unsolved),'trained':len(hcaptcha_trained)})
 
-@app.route('/api/new-hcaptcha', methods=['POST', 'OPTIONS'])
+@app.route('/api/new-hcaptcha', methods=['POST','OPTIONS'])
 def new_task():
-    if request.method == 'OPTIONS': return jsonify({'success': True}), 200
+    if request.method=='OPTIONS': return jsonify({'success':True}),200
     task = request.json
-    if not task or 'taskId' not in task: return jsonify({'success': False})
+    if not task or 'taskId' not in task: return jsonify({'success':False})
     tid = task['taskId']
 
-    # 1. Already trained mein hai?
+    # Already trained?
     if tid in hcaptcha_trained:
         entry = hcaptcha_trained[tid]
-        clicks = entry.get('clicks', [])
+        clicks = entry.get('clicks',[])
         if clicks:
-            return jsonify({'success': True, 'autoSolved': True,
-                            'clicks': clicks, 'source': entry.get('source')})
+            return jsonify({'success':True,'autoSolved':True,'clicks':clicks,'source':entry.get('source')})
 
-    # 2. Already unsolved mein processing ho raha hai?
+    # Already processing?
     if tid in hcaptcha_unsolved:
-        return jsonify({'success': True, 'autoSolved': False, 'status': 'processing'})
+        return jsonify({'success':True,'autoSolved':False,'status':'processing'})
 
-    # 3. BILKUL NAYA TASK
-    # ✅ PEHLE unsolved mein save karo (dashboard mein foran dikhe)
+    # Naya task - PEHLE unsolved mein save karo
     if len(hcaptcha_unsolved) >= 150:
-        oldest = min(hcaptcha_unsolved, key=lambda k: hcaptcha_unsolved[k].get('timestamp', 0))
+        oldest = min(hcaptcha_unsolved, key=lambda k: hcaptcha_unsolved[k].get('timestamp',0))
         del hcaptcha_unsolved[oldest]
 
     hcaptcha_unsolved[tid] = {
         'id': tid,
-        'prompt': task.get('prompt', ''),
-        'media': task.get('media', []),
+        'prompt': task.get('prompt',''),
+        'media': task.get('media',[]),
         'clicks': [],
         'source': 'unsolved',
         'timestamp': time.time()
     }
     threading.Thread(target=save_db, daemon=True).start()
 
-    # ✅ PHIR background mein AI run karo
+    # PHIR background mein AI
     threading.Thread(target=ai_background_job, args=(tid,), daemon=True).start()
 
-    # Extension ko bolo: polling karo
-    return jsonify({'success': True, 'autoSolved': False, 'ai_status': ai_status})
+    return jsonify({'success':True,'autoSolved':False,'ai_status':ai_status})
 
-
-@app.route('/api/check-hcaptcha/<task_id>', methods=['GET', 'OPTIONS'])
+@app.route('/api/check-hcaptcha/<task_id>', methods=['GET','OPTIONS'])
 def check_task(task_id):
-    if request.method == 'OPTIONS': return jsonify({'success': True}), 200
-
-    # Trained mein hai aur clicks hain? → solved
+    if request.method=='OPTIONS': return jsonify({'success':True}),200
     if task_id in hcaptcha_trained:
         entry = hcaptcha_trained[task_id]
-        clicks = entry.get('clicks', [])
+        clicks = entry.get('clicks',[])
         if clicks:
-            return jsonify({'status': 'solved', 'clicks': clicks, 'source': entry.get('source')})
+            return jsonify({'status':'solved','clicks':clicks,'source':entry.get('source')})
+    return jsonify({'status':'pending'})
 
-    # Abhi bhi unsolved (AI chal raha hai ya manual ka wait)
-    return jsonify({'status': 'pending'})
-
-
-@app.route('/api/get-hcaptcha', methods=['GET', 'OPTIONS'])
+@app.route('/api/get-hcaptcha', methods=['GET','OPTIONS'])
 def get_tasks():
-    if request.method == 'OPTIONS': return jsonify({'success': True}), 200
-    return jsonify({
-        'unsolved': hcaptcha_unsolved,
-        'trained': hcaptcha_trained,
-        'ai_status': ai_status
-    })
+    if request.method=='OPTIONS': return jsonify({'success':True}),200
+    return jsonify({'unsolved':hcaptcha_unsolved,'trained':hcaptcha_trained,'ai_status':ai_status})
 
-
-@app.route('/api/submit-hcaptcha', methods=['POST', 'OPTIONS'])
+@app.route('/api/submit-hcaptcha', methods=['POST','OPTIONS'])
 def submit_task():
-    """Dashboard se manual clicks submit"""
-    if request.method == 'OPTIONS': return jsonify({'success': True}), 200
+    if request.method=='OPTIONS': return jsonify({'success':True}),200
     data = request.json
     tid = data.get('taskId')
-    clicks = data.get('clicks', [])
+    clicks = data.get('clicks',[])
     is_retrain = data.get('retrain', False)
-    if not tid: return jsonify({'success': False})
+    if not tid: return jsonify({'success':False})
 
-    existing = hcaptcha_trained.get(tid, {})
-    old_source = existing.get('source', '')
-
-    if is_retrain and old_source == 'ai':
-        new_source = 'retrained'
-    else:
-        new_source = 'manual'
-
+    existing = hcaptcha_trained.get(tid,{})
+    old_source = existing.get('source','')
+    new_source = 'retrained' if (is_retrain and old_source=='ai') else 'manual'
     base = hcaptcha_unsolved.get(tid) or existing
 
     hcaptcha_trained[tid] = {
         'id': tid,
-        'prompt': base.get('prompt', ''),
-        'media': base.get('media', []),
+        'prompt': base.get('prompt',''),
+        'media': base.get('media',[]),
         'clicks': clicks,
-        'ai_clicks': existing.get('ai_clicks', existing.get('clicks', [])),
+        'ai_clicks': existing.get('ai_clicks', existing.get('clicks',[])),
         'source': new_source,
-        'confidences': existing.get('confidences', {}),
+        'confidences': existing.get('confidences',{}),
         'timestamp': time.time()
     }
     hcaptcha_unsolved.pop(tid, None)
     threading.Thread(target=save_db, daemon=True).start()
-    return jsonify({'success': True, 'source': new_source})
+    return jsonify({'success':True,'source':new_source})
 
-
-@app.route('/api/delete-hcaptcha/<task_id>', methods=['DELETE', 'OPTIONS'])
+@app.route('/api/delete-hcaptcha/<task_id>', methods=['DELETE','OPTIONS'])
 def delete_task(task_id):
-    if request.method == 'OPTIONS': return jsonify({'success': True}), 200
+    if request.method=='OPTIONS': return jsonify({'success':True}),200
     hcaptcha_unsolved.pop(task_id, None)
     hcaptcha_trained.pop(task_id, None)
     threading.Thread(target=save_db, daemon=True).start()
-    return jsonify({'success': True})
-
+    return jsonify({'success':True})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=3000, threaded=True)

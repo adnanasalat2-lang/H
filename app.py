@@ -65,29 +65,34 @@ def save_db():
             print(f"DB Error: {e}")
 
 def decode_image(src):
-    """Base64 ya URL se PIL Image banao"""
     try:
-        if src.startswith('data:'):
-            b64 = src.split(',')[1]
-        else:
-            b64 = src
+        b64 = src.split(',')[1] if src.startswith('data:') else src
         return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
     except:
         return None
 
 def run_ai(task):
     """
-    Returns (clicks, confidences) or (None, None)
-    
-    ✅ FIX: Pehle saari images ko score karo, phir TOP scores wali select karo
-    CLIP ko fixed threshold se mat rokao - relative ranking use karo
+    GRID tasks (9 images) → AI try karta hai relative ranking se
+    Single image / coordinate tasks → None return (unsolved mein rahe)
     """
-    if ai_status != "Ready" or not task.get('media'):
+    if ai_status != "Ready":
         return None, None
+
+    media = task.get('media', [])
+
+    # ✅ RULE 1: Single image tasks → manual training chahiye
+    if len(media) == 1:
+        print(f"[AI] Skip: only 1 image (single/coordinate task)")
+        return None, None
+
+    # ✅ RULE 2: Grid tasks → minimum 4 images honi chahiye (hCaptcha standard 9 hai)
+    if len(media) < 4:
+        print(f"[AI] Skip: only {len(media)} images")
+        return None, None
+
     try:
         prompt_full = task.get('prompt', '')
-        media = task.get('media', [])
-
         has_ref = '|||' in prompt_full
         raw_text = prompt_full.split('|||')[0].strip()
         clean_text = (raw_text.lower()
@@ -95,7 +100,6 @@ def run_ai(task):
             .replace('please click on the ', '')
             .replace('images with ', '')
             .replace('click on all concepts shown in the reference', '')
-            .replace('find all animals based on the number provided', '')
             .strip()) or "object"
 
         # Images load karo
@@ -103,15 +107,17 @@ def run_ai(task):
         for m in media:
             if not m.get('src'): continue
             img = decode_image(m['src'])
-            if img: loaded.append((m['index'], img))
+            if img:
+                loaded.append((m['index'], img))
 
-        if not loaded: return None, None
+        if len(loaded) < 4:
+            print(f"[AI] Skip: only {len(loaded)} images loaded successfully")
+            return None, None
 
-        scores = {}  # index -> score (0-1)
+        scores = {}
 
         with torch.no_grad():
             if has_ref:
-                # ✅ Image-to-Image: reference se compare
                 ref_src = prompt_full.split('|||')[1]
                 ref_img = decode_image(ref_src)
                 if not ref_img: return None, None
@@ -124,28 +130,20 @@ def run_ai(task):
                     img_in = ai_processor(images=img, return_tensors="pt")
                     feat = ai_model.get_image_features(**img_in)
                     feat = feat / feat.norm(p=2, dim=-1, keepdim=True)
-                    sim = (ref_feat @ feat.T).item()
-                    scores[idx] = round(sim, 3)
+                    scores[idx] = round((ref_feat @ feat.T).item(), 3)
 
-                # ✅ Relative: mean se upar wali images select karo
-                if scores:
-                    vals = list(scores.values())
-                    mean_score = sum(vals) / len(vals)
-                    # Threshold: mean + 10% gap, ya minimum 0.55
-                    threshold = max(mean_score + 0.05, 0.55)
-                    clicks = [idx for idx, s in scores.items() if s >= threshold]
-
-                    # ✅ Agar koi nahi mila, sirf top 1-2 le lo
-                    if not clicks:
-                        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-                        clicks = [sorted_scores[0][0]] if sorted_scores else []
+                vals = list(scores.values())
+                mean_s = sum(vals) / len(vals)
+                threshold = max(mean_s + 0.05, 0.55)
+                clicks = [i for i, s in scores.items() if s >= threshold]
+                if not clicks:
+                    clicks = [max(scores, key=scores.get)]
 
             else:
-                # ✅ Text-to-Image: har image ko score karo
                 labels = [
                     f"a photo of {clean_text}",
                     f"a photo of a {clean_text}",
-                    "a photo of something completely different",
+                    "a photo of something unrelated",
                 ]
                 text_in = ai_processor(text=labels, return_tensors="pt", padding=True)
 
@@ -153,51 +151,47 @@ def run_ai(task):
                     img_in = ai_processor(images=img, return_tensors="pt")
                     out = ai_model(**img_in, **text_in)
                     probs = out.logits_per_image.softmax(dim=1)
-                    # Score = probability of being the target (label 0 + label 1 combined)
-                    score = probs[0][0].item() + probs[0][1].item() * 0.5
-                    scores[idx] = round(score, 3)
+                    scores[idx] = round(probs[0][0].item() + probs[0][1].item() * 0.5, 3)
 
-                # ✅ Relative selection: mean se upar wali
-                if scores:
-                    vals = list(scores.values())
-                    mean_score = sum(vals) / len(vals)
-                    max_score  = max(vals)
+                vals = list(scores.values())
+                mean_s = sum(vals) / len(vals)
+                max_s  = max(vals)
 
-                    # Dynamic threshold
-                    # Agar max score bohot high hai (>0.6), strict threshold
-                    # Agar max score medium hai (0.3-0.6), loose threshold
-                    if max_score > 0.6:
-                        threshold = mean_score + 0.08
-                    elif max_score > 0.35:
-                        threshold = mean_score + 0.03
-                    else:
-                        # Scores bohot low - shayad AI nahi samajh raha, null return karo
-                        return None, {}
+                if max_s < 0.25:
+                    print(f"[AI] Skip: max score too low ({max_s:.3f})")
+                    return None, {}
 
-                    clicks = [idx for idx, s in scores.items() if s >= threshold]
+                threshold = mean_s + (0.08 if max_s > 0.6 else 0.03)
+                clicks = [i for i, s in scores.items() if s >= threshold]
 
-                    # ✅ Minimum 1, maximum based on typical hCaptcha (1-6 usually)
-                    if not clicks and max_score > 0.25:
-                        sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-                        clicks = [sorted_scores[0][0]]
+                if not clicks and max_s > 0.25:
+                    clicks = [max(scores, key=scores.get)]
 
         gc.collect()
         confidences = {str(k): v for k, v in scores.items()}
-        print(f"AI Result: clicks={clicks}, scores={scores}")
+        print(f"[AI] clicks={clicks} scores={scores}")
         return clicks, confidences
 
     except Exception as e:
-        print(f"AI Error: {e}")
+        print(f"[AI] Error: {e}")
         return None, None
 
 
 def ai_background_job(tid):
     task = hcaptcha_unsolved.get(tid)
-    if not task: return
+    if not task:
+        print(f"[AI Job] Task {tid} not found in unsolved")
+        return
+
+    media = task.get('media', [])
+    print(f"[AI Job] Processing {tid} | media count: {len(media)}")
 
     ai_clicks, confidences = run_ai(task)
 
-    if tid not in hcaptcha_unsolved: return  # manual ne solve kar diya
+    # ✅ Double check: task abhi bhi unsolved mein hai?
+    if tid not in hcaptcha_unsolved:
+        print(f"[AI Job] {tid} already removed (manual solved)")
+        return
 
     if ai_clicks is not None:
         hcaptcha_trained[tid] = {
@@ -211,16 +205,18 @@ def ai_background_job(tid):
             'timestamp': time.time()
         }
         hcaptcha_unsolved.pop(tid, None)
-        print(f"✅ AI solved {tid}: {ai_clicks}")
+        print(f"[AI Job] ✅ Solved {tid}: {ai_clicks}")
     else:
-        print(f"⏳ AI could not solve {tid}, manual needed")
+        # ✅ AI nahi kar saka - unsolved mein REHNE DO
+        print(f"[AI Job] ❌ Could not solve {tid} - stays in unsolved for manual training")
 
     threading.Thread(target=save_db, daemon=True).start()
 
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({'status':'Active','ai':ai_status,'unsolved':len(hcaptcha_unsolved),'trained':len(hcaptcha_trained)})
+    return jsonify({'status':'Active','ai':ai_status,
+                    'unsolved':len(hcaptcha_unsolved),'trained':len(hcaptcha_trained)})
 
 @app.route('/api/new-hcaptcha', methods=['POST','OPTIONS'])
 def new_task():
@@ -228,19 +224,25 @@ def new_task():
     task = request.json
     if not task or 'taskId' not in task: return jsonify({'success':False})
     tid = task['taskId']
+    media = task.get('media', [])
 
-    # Already trained?
+    print(f"[NEW] Task {tid} | media: {len(media)}")
+
+    # Already trained with clicks?
     if tid in hcaptcha_trained:
         entry = hcaptcha_trained[tid]
-        clicks = entry.get('clicks',[])
+        clicks = entry.get('clicks', [])
         if clicks:
-            return jsonify({'success':True,'autoSolved':True,'clicks':clicks,'source':entry.get('source')})
+            print(f"[NEW] Already trained: {tid}")
+            return jsonify({'success':True,'autoSolved':True,
+                           'clicks':clicks,'source':entry.get('source')})
 
-    # Already processing?
+    # Already in unsolved (being processed)?
     if tid in hcaptcha_unsolved:
+        print(f"[NEW] Already in unsolved: {tid}")
         return jsonify({'success':True,'autoSolved':False,'status':'processing'})
 
-    # Naya task - PEHLE unsolved mein save karo
+    # Naya task - PEHLE unsolved mein save
     if len(hcaptcha_unsolved) >= 150:
         oldest = min(hcaptcha_unsolved, key=lambda k: hcaptcha_unsolved[k].get('timestamp',0))
         del hcaptcha_unsolved[oldest]
@@ -248,7 +250,7 @@ def new_task():
     hcaptcha_unsolved[tid] = {
         'id': tid,
         'prompt': task.get('prompt',''),
-        'media': task.get('media',[]),
+        'media': media,
         'clicks': [],
         'source': 'unsolved',
         'timestamp': time.time()
@@ -260,31 +262,36 @@ def new_task():
 
     return jsonify({'success':True,'autoSolved':False,'ai_status':ai_status})
 
+
 @app.route('/api/check-hcaptcha/<task_id>', methods=['GET','OPTIONS'])
 def check_task(task_id):
     if request.method=='OPTIONS': return jsonify({'success':True}),200
+
     if task_id in hcaptcha_trained:
         entry = hcaptcha_trained[task_id]
-        clicks = entry.get('clicks',[])
+        clicks = entry.get('clicks', [])
         if clicks:
             return jsonify({'status':'solved','clicks':clicks,'source':entry.get('source')})
+
     return jsonify({'status':'pending'})
+
 
 @app.route('/api/get-hcaptcha', methods=['GET','OPTIONS'])
 def get_tasks():
     if request.method=='OPTIONS': return jsonify({'success':True}),200
     return jsonify({'unsolved':hcaptcha_unsolved,'trained':hcaptcha_trained,'ai_status':ai_status})
 
+
 @app.route('/api/submit-hcaptcha', methods=['POST','OPTIONS'])
 def submit_task():
     if request.method=='OPTIONS': return jsonify({'success':True}),200
     data = request.json
     tid = data.get('taskId')
-    clicks = data.get('clicks',[])
+    clicks = data.get('clicks', [])
     is_retrain = data.get('retrain', False)
     if not tid: return jsonify({'success':False})
 
-    existing = hcaptcha_trained.get(tid,{})
+    existing = hcaptcha_trained.get(tid, {})
     old_source = existing.get('source','')
     new_source = 'retrained' if (is_retrain and old_source=='ai') else 'manual'
     base = hcaptcha_unsolved.get(tid) or existing
@@ -300,8 +307,10 @@ def submit_task():
         'timestamp': time.time()
     }
     hcaptcha_unsolved.pop(tid, None)
+    print(f"[SUBMIT] {tid} → {new_source}, clicks: {clicks}")
     threading.Thread(target=save_db, daemon=True).start()
     return jsonify({'success':True,'source':new_source})
+
 
 @app.route('/api/delete-hcaptcha/<task_id>', methods=['DELETE','OPTIONS'])
 def delete_task(task_id):
@@ -310,6 +319,7 @@ def delete_task(task_id):
     hcaptcha_trained.pop(task_id, None)
     threading.Thread(target=save_db, daemon=True).start()
     return jsonify({'success':True})
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=3000, threaded=True)
